@@ -1,0 +1,160 @@
+name: Build NeuroScope for macOS
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:  # This allows you to trigger manually
+
+jobs:
+  build-macos:
+    runs-on: macos-12  # Using macOS 12 for better compatibility
+    
+    strategy:
+      matrix:
+        include:
+          - qt_version: '5.15.2'
+            qt_arch: 'clang_64'
+            arch: 'x86_64'
+          - qt_version: '5.15.2'
+            qt_arch: 'clang_64'
+            arch: 'arm64'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: ${{ matrix.qt_version }}
+        target: 'desktop'
+        arch: ${{ matrix.qt_arch }}
+        modules: 'qtwebengine'
+        
+    - name: Install dependencies
+      run: |
+        # Install build tools
+        brew install cmake pkg-config
+        
+        # Check if libneurosuite is needed
+        if [ ! -d "libneurosuite" ]; then
+          echo "Cloning libneurosuite..."
+          git clone https://github.com/neurosuite/libneurosuite.git
+        fi
+        
+    - name: Build libneurosuite
+      run: |
+        if [ -d "libneurosuite" ]; then
+          cd libneurosuite
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+          make -j$(sysctl -n hw.ncpu)
+          sudo make install
+          cd ../..
+        fi
+        
+    - name: Configure NeuroScope
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. \
+          -DCMAKE_PREFIX_PATH="$Qt5_DIR" \
+          -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+        
+    - name: Build NeuroScope
+      run: |
+        cd build
+        make -j$(sysctl -n hw.ncpu)
+        
+    - name: Package Application
+      run: |
+        cd build
+        
+        # Find the app bundle
+        APP_BUNDLE=$(find . -name "*.app" -type d | head -1)
+        
+        if [ -z "$APP_BUNDLE" ]; then
+          echo "No app bundle found!"
+          exit 1
+        fi
+        
+        echo "Found app bundle: $APP_BUNDLE"
+        
+        # Use macdeployqt to bundle Qt frameworks
+        $Qt5_DIR/bin/macdeployqt "$APP_BUNDLE" -dmg
+        
+        # Rename DMG for clarity
+        DMG_FILE=$(find . -name "*.dmg" | head -1)
+        if [ -n "$DMG_FILE" ]; then
+          mv "$DMG_FILE" "NeuroScope-${{ matrix.arch }}.dmg"
+        fi
+        
+    - name: Upload DMG
+      uses: actions/upload-artifact@v3
+      with:
+        name: NeuroScope-macOS-${{ matrix.arch }}
+        path: build/*.dmg
+        if-no-files-found: error
+        
+    - name: Upload App Bundle (if DMG fails)
+      uses: actions/upload-artifact@v3
+      with:
+        name: NeuroScope-macOS-${{ matrix.arch }}-app
+        path: build/*.app
+        if-no-files-found: ignore
+
+  create-universal-binary:
+    needs: build-macos
+    runs-on: macos-12
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      
+    - name: Create Universal Binary
+      run: |
+        # Extract both DMGs
+        hdiutil attach NeuroScope-macOS-x86_64/NeuroScope-x86_64.dmg -nobrowse -mountpoint /Volumes/NS_x86
+        hdiutil attach NeuroScope-macOS-arm64/NeuroScope-arm64.dmg -nobrowse -mountpoint /Volumes/NS_arm64
+        
+        # Copy apps
+        cp -R /Volumes/NS_x86/*.app ./NeuroScope_x86.app
+        cp -R /Volumes/NS_arm64/*.app ./NeuroScope_arm64.app
+        
+        # Create universal binary
+        cp -R NeuroScope_x86.app NeuroScope_Universal.app
+        
+        # Merge binaries
+        BINARY_NAME=$(find NeuroScope_x86.app -type f -perm +111 -name "neuroscope" -o -name "NeuroScope" | grep -v ".framework" | head -1 | xargs basename)
+        lipo -create \
+          "NeuroScope_x86.app/Contents/MacOS/$BINARY_NAME" \
+          "NeuroScope_arm64.app/Contents/MacOS/$BINARY_NAME" \
+          -output "NeuroScope_Universal.app/Contents/MacOS/$BINARY_NAME"
+        
+        # Create final DMG
+        brew install create-dmg
+        create-dmg \
+          --volname "NeuroScope" \
+          --window-pos 200 120 \
+          --window-size 600 400 \
+          --icon-size 100 \
+          --app-drop-link 450 185 \
+          "NeuroScope-Universal.dmg" \
+          "NeuroScope_Universal.app"
+        
+        # Cleanup
+        hdiutil detach /Volumes/NS_x86
+        hdiutil detach /Volumes/NS_arm64
+        
+    - name: Upload Universal DMG
+      uses: actions/upload-artifact@v3
+      with:
+        name: NeuroScope-macOS-Universal
+        path: NeuroScope-Universal.dmg
